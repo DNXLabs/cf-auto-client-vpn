@@ -1,0 +1,489 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "Client VPN"
+
+Parameters:
+  SplitTunnel:
+    Type: String
+    Description: "Split Tunnel - 'false' means all traffic goes through the VPN"
+    Default: "true"
+    AllowedValues: 
+      - "true"
+      - "false"
+  SAMLProviderArn:
+    Type: String
+    Description: "ARN of the SAML provider for the VPN - See https://aws.amazon.com/blogs/security/authenticate-aws-client-vpn-users-with-aws-single-sign-on/"
+    Default: ""
+  SelfServiceSAMLProviderArn:
+    Type: String
+    Description: "ARN of the SAML provider for the self-service portal"
+    Default: ""
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: "VPC ID"
+    Default: ""
+  SubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Description: "Subnet ID"
+    Default: ""
+  VPNUp:
+    Type: String
+    Description: "VPN Up"
+    AllowedValues: 
+      - "true"
+      - "false"
+
+Conditions:
+  IsSplitTunnel: !Equals [ !Ref SplitTunnel, "true" ]
+  IsVPNUp: !Equals [ !Ref VPNUp, "true" ]
+
+Resources:
+  ClientVpnEndpoint:
+    Type: AWS::EC2::ClientVpnEndpoint
+    Properties: 
+      AuthenticationOptions:
+      - Type: "federated-authentication"
+        FederatedAuthentication:
+          SAMLProviderArn: !Ref SAMLProviderArn
+          SelfServiceSAMLProviderArn: !Ref SelfServiceSAMLProviderArn
+      ClientCidrBlock: "192.168.252.0/22"
+      ConnectionLogOptions: 
+        CloudwatchLogGroup: !Ref LogGroup
+        Enabled: true
+      Description: "ClientVPN"
+      # DnsServers: 
+      #   - "11.11.0.1"
+      SelfServicePortal: enabled
+      ServerCertificateArn: !GetAtt ImportCertificate.CertificateArn
+      SplitTunnel: !If [ IsSplitTunnel, true, false ]
+      TransportProtocol: "udp"
+      SecurityGroupIds:
+        - !GetAtt ClientVpnSecurityGroup.GroupId
+      VpcId: !Ref VpcId
+
+  ClientVpnTargetNetworkAssociation:
+    Condition: IsVPNUp
+    Type: AWS::EC2::ClientVpnTargetNetworkAssociation
+    Properties:
+      ClientVpnEndpointId: !Ref ClientVpnEndpoint
+      SubnetId: !Ref SubnetId
+
+  ClientVpnAuthorizationRule:
+    Type: "AWS::EC2::ClientVpnAuthorizationRule"
+    Properties:
+      ClientVpnEndpointId: !Ref ClientVpnEndpoint
+      AuthorizeAllGroups: true
+      TargetNetworkCidr: "0.0.0.0/0"
+      Description: "Allow Access"
+
+  ClientVpnSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow access to VPC
+      VpcId: !Ref VpcId
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          FromPort: -1
+          ToPort: -1
+          CidrIp: 0.0.0.0/0
+      SecurityGroupIngress:
+        - IpProtocol: -1
+          FromPort: -1
+          ToPort: -1
+          CidrIp: 0.0.0.0/0
+
+  LogGroup: 
+    Type: 'AWS::Logs::LogGroup'
+    DeletionPolicy: Retain
+    Properties: 
+      RetentionInDays: 731
+
+  ImportCertificate:
+    Type: Custom::CustomImportCertificate
+    Properties:
+      ServiceToken: !GetAtt 'CustomResourceFunctionImportCertificate.Arn'
+
+  CustomResourceFunctionImportCertificate:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.lambda_handler
+      Timeout: 30
+      Role: !GetAtt 'CustomResourceFunctionImportCertificateRole.Arn'
+      Runtime: python3.12
+      Layers:
+        - !Sub "arn:aws:lambda:${AWS::Region}:770693421928:layer:Klayers-p312-cryptography:4"
+      Code:
+        ZipFile: |
+          import boto3
+          import cfnresponse
+
+          from datetime import datetime, timedelta
+          from cryptography import x509
+          from cryptography.x509.oid import NameOID
+          from cryptography.hazmat.primitives import hashes
+          from cryptography.hazmat.backends import default_backend
+          from cryptography.hazmat.primitives import serialization
+          from cryptography.hazmat.primitives.asymmetric import rsa
+
+          client = boto3.client('acm')
+
+          def generate():
+            key = rsa.generate_private_key(public_exponent=65537,key_size=2048,backend=default_backend())
+            
+            name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "server.vpn.client")])
+            
+            basic_contraints = x509.BasicConstraints(ca=True, path_length=0)
+            key_usage = x509.KeyUsage(digital_signature=True, key_encipherment=True, key_cert_sign=True,
+                                      key_agreement=False, content_commitment=False, data_encipherment=False,
+                                      crl_sign=False, encipher_only=False, decipher_only=False)
+            extended_key_usage = x509.ExtendedKeyUsage([x509.oid.ExtendedKeyUsageOID.SERVER_AUTH])
+
+            now = datetime.utcnow()
+            cert = (
+                x509.CertificateBuilder()
+                .subject_name(name)
+                .issuer_name(name)
+                .public_key(key.public_key())
+                .serial_number(1000)
+                .not_valid_before(now)
+                .not_valid_after(now + timedelta(days=10*365))
+                .add_extension(basic_contraints, False)
+                .add_extension(key_usage, True)
+                .add_extension(extended_key_usage, False)
+                .sign(key, hashes.SHA256(), default_backend())
+            )
+            cert_pem = cert.public_bytes(encoding=serialization.Encoding.PEM)
+            key_pem = key.private_bytes(
+                encoding=serialization.Encoding.PEM,
+                format=serialization.PrivateFormat.TraditionalOpenSSL,
+                encryption_algorithm=serialization.NoEncryption(),
+            )
+
+            return cert_pem, key_pem
+
+          def lambda_handler(event, context):
+            responseData = {}
+            physicalResourceId = None
+            try:
+              if event['RequestType'] == 'Delete':
+                response = client.delete_certificate(CertificateArn=event['PhysicalResourceId'])
+
+              if event['RequestType'] == 'Create':
+                cert = generate()
+                response = client.import_certificate(
+                  Certificate=cert[0],
+                  PrivateKey=cert[1],
+                  Tags=[{'Key': 'Name', 'Value': 'ClientVPN'}]
+                )
+                responseData = {
+                  'CertificateArn': response['CertificateArn']
+                }
+                physicalResourceId = response['CertificateArn']
+            except Exception as e:
+              return cfnresponse.send(event, context, cfnresponse.FAILED, { 'Error': str(e) })
+
+            cfnresponse.send(event, context, cfnresponse.SUCCESS, responseData, physicalResourceId)
+
+  CustomResourceFunctionImportCertificateRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: lambda.amazonaws.com
+          Action: sts:AssumeRole
+      Path: "/"
+      Policies:
+      - PolicyName: root
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action:
+              - acm:ImportCertificate
+              - acm:DeleteCertificate
+              - acm:AddTagsToCertificate
+              - acm:RemoveTagsFromCertificate
+              - logs:*
+            Resource: "*"
+
+  LambdaFunctionAutoStart:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.12
+      FunctionName: !Sub "AWSClientVPN-AutoStart-${AWS::StackName}"
+      Role: !GetAtt LambdaFunctionRole.Arn
+      Handler: index.lambda_handler
+      Timeout: 10
+      Code:
+        ZipFile: !Sub 
+          - |
+            import boto3
+            import botocore
+            import time
+
+            def lambda_handler(event, context):
+              # update ssm Parameter
+              ssm = boto3.client('ssm')
+              ssm.put_parameter(
+                Name="/${StackName}/LastVPNUp",
+                Value=str(int(time.time())),
+                Type='String',
+                Overwrite=True
+              )
+
+              client = boto3.client('cloudformation', region_name="${Region}")
+              response = client.describe_stacks(
+                StackName="${StackName}"
+              )
+
+              param_vpn_up = next((x for x in response['Stacks'][0]['Parameters'] if x['ParameterKey'] == 'VPNUp'), None)
+              param_vpc_id = next((x for x in response['Stacks'][0]['Parameters'] if x['ParameterKey'] == 'VpcId'), None)
+              param_subnet_id = next((x for x in response['Stacks'][0]['Parameters'] if x['ParameterKey'] == 'SubnetId'), None)
+              param_self_service_saml_provider_arn = next((x for x in response['Stacks'][0]['Parameters'] if x['ParameterKey'] == 'SelfServiceSAMLProviderArn'), None)
+              param_saml_provider_arn = next((x for x in response['Stacks'][0]['Parameters'] if x['ParameterKey'] == 'SAMLProviderArn'), None)
+              param_split_tunnel = next((x for x in response['Stacks'][0]['Parameters'] if x['ParameterKey'] == 'SplitTunnel'), None)
+              output_self_service_url = next((x for x in response['Stacks'][0]['Outputs'] if x['OutputKey'] == 'SelfServicePortalURL'), None)
+              output_vpn_up = next((x for x in response['Stacks'][0]['Outputs'] if x['OutputKey'] == 'VPNUp'), None)
+
+              if param_vpn_up['ParameterValue'] == 'true' and output_vpn_up == None:
+                return {
+                  "statusCode": 200,
+                  "body": "VPN is coming up, try again in a few minutes. Self Service Portal URL: " + output_self_service_url['OutputValue'],
+                }
+              elif param_vpn_up['ParameterValue'] == 'true' and output_vpn_up['OutputValue'] == 'true':
+                return {
+                  "statusCode": 200,
+                  "body": "VPN is up. Self Service Portal URL: " + output_self_service_url['OutputValue'],
+                }
+
+              try:
+                response = client.update_stack(
+                  StackName="${StackName}",
+                  UsePreviousTemplate=True,
+                  Capabilities=['CAPABILITY_IAM'],
+                  Parameters=[
+                    {
+                      'ParameterKey': 'VPNUp',
+                      'ParameterValue': 'true',
+                    },
+                    {
+                      'ParameterKey': 'VpcId',
+                      'ParameterValue': param_vpc_id['ParameterValue'],
+                    },
+                    {
+                      'ParameterKey': 'SubnetId',
+                      'ParameterValue': param_subnet_id['ParameterValue'],
+                    },
+                    {
+                      'ParameterKey': 'SplitTunnel',
+                      'ParameterValue': param_split_tunnel['ParameterValue'],
+                    },
+                    {
+                      'ParameterKey': 'SelfServiceSAMLProviderArn',
+                      'ParameterValue': param_self_service_saml_provider_arn['ParameterValue'],
+                    },
+                    {
+                      'ParameterKey': 'SAMLProviderArn',
+                      'ParameterValue': param_saml_provider_arn['ParameterValue'],
+                    }
+                  ]
+                )
+              except botocore.exceptions.ValidationError as e:
+                return {
+                  'statusCode': 500,
+                  'body': "VPN updating, try again in a few minutes."
+                }
+
+              return {
+                "statusCode": 200,
+                "body": "VPN is coming up, try again in a few minutes. Self Service Portal URL: " + output_self_service_url['OutputValue'],
+              }
+
+          - { Region: !Ref "AWS::Region", StackName: !Ref "AWS::StackName" }
+
+  LambdaFunctionAutoStartUrl:
+    Type: AWS::Lambda::Url
+    Properties:
+      AuthType: NONE
+      TargetFunctionArn: !GetAtt LambdaFunctionAutoStart.Arn
+
+  LambdaFunctionAutoStartPermission:
+     Type: AWS::Lambda::Permission
+     Properties:
+       FunctionName: !Ref LambdaFunctionAutoStart
+       FunctionUrlAuthType: 'NONE'
+       Action: lambda:InvokeFunctionUrl
+       Principal: '*'
+
+  LambdaFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: lambda.amazonaws.com
+          Action: sts:AssumeRole
+      Path: "/"
+      Policies:
+      - PolicyName: root
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action:
+              - logs:*
+              - ec2:Describe*
+              - ec2:*ClientVpnEndpoint
+              - ec2:*ClientVpnEndpoints
+              - ec2:*ClientVpnTargetNetwork
+              - ec2:*ClientVpnTargetNetworks
+              - ec2:*ClientVpnIngress
+              - ec2:*ClientVpnConnections
+              - ec2:*ClientVpnRoute
+              - ec2:*ClientVpnAuthorizationRules
+              - ec2:*ClientVpnClientCertificateRevocationList
+              - ec2:*ClientVpnClientConfiguration
+              - lambda:*
+              - iam:*ServiceLinkedRole
+              - iam:GetRole
+              - iam:PassRole
+              - events:*
+              - ssm:*
+            Resource: "*"
+          - Effect: Allow
+            Action:
+              - cloudformation:*
+            Resource: !Ref AWS::StackId
+
+  LambdaFunctionAutoStop:
+    Condition: IsVPNUp
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.12
+      FunctionName: !Sub "AWSClientVPN-AutoStop-${AWS::StackName}"
+      Role: !GetAtt LambdaFunctionRole.Arn
+      Handler: index.lambda_handler
+      Timeout: 10
+      Code:
+        ZipFile: !Sub 
+          - |
+            import boto3
+            import time
+
+            def lambda_handler(event, context):
+              # check if VPN is up for at least 1 hr before stopping
+              ssm = boto3.client('ssm')
+              response = ssm.get_parameter(Name="/${StackName}/LastVPNUp")
+              last_vpn_up = int(response['Parameter']['Value'])
+              if last_vpn_up + 3600 > int(time.time()):
+                print("VPN was up less than 1 hr ago")
+                return
+
+              client_vpn = boto3.client('ec2', region_name="${Region}")
+
+              connections = []
+              response = {}
+              while True:
+                response = client_vpn.describe_client_vpn_connections(ClientVpnEndpointId="${ClientVpnEndpoint}", NextToken=response.get('NextToken', ''))
+                for connection in response['Connections']:
+                  connections.append(connection)
+                if response.get('NextToken', '') == '' or len(response['Connections']) == 0: 
+                  break
+
+              if len(connections) != 0:
+                print("Users connected: " + str(len(connections)))
+                return
+
+              client = boto3.client('cloudformation', region_name="${Region}")
+              response = client.describe_stacks(
+                StackName="${StackName}"
+              )
+
+              param_vpn_up = next((x for x in response['Stacks'][0]['Parameters'] if x['ParameterKey'] == 'VPNUp'), None)
+              param_vpc_id = next((x for x in response['Stacks'][0]['Parameters'] if x['ParameterKey'] == 'VpcId'), None)
+              param_subnet_id = next((x for x in response['Stacks'][0]['Parameters'] if x['ParameterKey'] == 'SubnetId'), None)
+              param_self_service_saml_provider_arn = next((x for x in response['Stacks'][0]['Parameters'] if x['ParameterKey'] == 'SelfServiceSAMLProviderArn'), None)
+              param_saml_provider_arn = next((x for x in response['Stacks'][0]['Parameters'] if x['ParameterKey'] == 'SAMLProviderArn'), None)
+              param_split_tunnel = next((x for x in response['Stacks'][0]['Parameters'] if x['ParameterKey'] == 'SplitTunnel'), None)
+
+              response = client.update_stack(
+                StackName="${StackName}",
+                UsePreviousTemplate=True,
+                Capabilities=['CAPABILITY_IAM'],
+                Parameters=[
+                  {
+                    'ParameterKey': 'VPNUp',
+                    'ParameterValue': 'false',
+                  },
+                  {
+                    'ParameterKey': 'VpcId',
+                    'ParameterValue': param_vpc_id['ParameterValue'],
+                  },
+                  {
+                    'ParameterKey': 'SubnetId',
+                    'ParameterValue': param_subnet_id['ParameterValue'],
+                  },
+                  {
+                    'ParameterKey': 'SplitTunnel',
+                    'ParameterValue': param_split_tunnel['ParameterValue'],
+                  },
+                  {
+                    'ParameterKey': 'SelfServiceSAMLProviderArn',
+                    'ParameterValue': param_self_service_saml_provider_arn['ParameterValue'],
+                  },
+                  {
+                    'ParameterKey': 'SAMLProviderArn',
+                    'ParameterValue': param_saml_provider_arn['ParameterValue'],
+                  }
+                ]
+              )
+              print("Stopping VPN")
+              return
+
+          - { Region: !Ref "AWS::Region", StackName: !Ref "AWS::StackName", ClientVpnEndpoint: !Ref ClientVpnEndpoint }
+
+  SSMParameterLastVPNUp:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/${AWS::StackName}/LastVPNUp"
+      Type: String
+      Value: "0"
+      Description: Last time VPN was up, in unixtime
+
+  LambdaFunctionAutoStopPermission:
+    Condition: IsVPNUp
+    Type: AWS::Lambda::Permission
+    Properties: 
+      FunctionName: !Ref "LambdaFunctionAutoStop"
+      Action: "lambda:InvokeFunction"
+      Principal: "events.amazonaws.com"
+      SourceArn: !GetAtt "ScheduledRuleLambdaFunctionAutoStop.Arn"
+
+  ScheduledRuleLambdaFunctionAutoStop:
+    Condition: IsVPNUp
+    Type: AWS::Events::Rule
+    Properties: 
+      Description: "ClientVPN Auto-Stop"
+      ScheduleExpression: "rate(10 minutes)"
+      State: "ENABLED"
+      Targets: 
+        - Arn: !GetAtt LambdaFunctionAutoStop.Arn
+          Id: "LambdaFunctionAutoStop"
+
+Outputs:
+  SelfServicePortalURL:
+    Description: Self Service Portal URL
+    Value: !Sub "https://self-service.clientvpn.amazonaws.com/endpoints/${ClientVpnEndpoint}"
+
+  AutoStartUrl:
+    Description: "URL to trigger starting the VPN"
+    Value: !GetAtt LambdaFunctionAutoStartUrl.FunctionUrl
+
+  VPNUp:
+    Condition: IsVPNUp
+    Description: "VPN Up"
+    Value: !Ref VPNUp
